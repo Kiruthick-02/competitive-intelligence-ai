@@ -1,68 +1,100 @@
 import os
 import re
-from pymongo import MongoClient
+from pymongo import MongoClient, UpdateOne
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.decomposition import LatentDirichletAllocation
 from dotenv import load_dotenv
 
 load_dotenv()
+
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "competitive_intelligence")
 
+
 def clean_text(text):
-    if not isinstance(text, str): return ""
+    if not isinstance(text, str):
+        return ""
     text = text.lower()
     text = re.sub(r'[^a-z\s]', '', text)
     return text
 
+
 def run_topic_modeling():
+
+    print("Connecting to MongoDB...")
     client = MongoClient(MONGO_URI)
     db = client[DATABASE_NAME]
-    
-    print("Starting Topic Modeling (LDA)...")
-    
-    # Get all unique products that have reviews
-    unique_asins = db.reviews.distinct("asin")
-    print(f"Found {len(unique_asins)} products to analyze.")
-    
-    for asin in unique_asins:
-        # Fetch only Negative or Neutral reviews for complaint extraction
-        reviews = list(db.reviews.find({"asin": asin, "sentiment": {"$in": ["Negative", "Neutral"]}}))
-        
-        cleaned_reviews =[clean_text(r.get("reviewText", "")) for r in reviews if r.get("reviewText")]
-        cleaned_reviews =[r for r in cleaned_reviews if len(r.split()) > 3] # Keep meaningful sentences
-        
-        if len(cleaned_reviews) < 5:
-            # Not enough data for LDA
-            continue
-            
-        try:
-            vectorizer = CountVectorizer(max_df=0.95, min_df=2, stop_words='english')
-            dtm = vectorizer.fit_transform(cleaned_reviews)
-            
-            # Extract 3 main topics
-            lda = LatentDirichletAllocation(n_components=3, random_state=42)
-            lda.fit(dtm)
-            
-            topics =[]
-            feature_names = vectorizer.get_feature_names_out()
-            for topic_idx, topic in enumerate(lda.components_):
-                # Get top 5 keywords per topic
-                top_keywords = [feature_names[i] for i in topic.argsort()[:-5 - 1:-1]]
-                topics.append({"topic_id": topic_idx + 1, "keywords": top_keywords})
-            
-            # Save the topics into the insights collection
-            db.insights.update_one(
-                {"asin": asin},
-                {"$set": {"asin": asin, "complaint_topics": topics}},
-                upsert=True
-            )
-            print(f"Processed topics for ASIN: {asin}")
-            
-        except Exception as e:
-            print(f"Skipping ASIN {asin} due to error: {e}")
 
-    print("Topic Modeling Complete!")
+    print("Fetching ALL reviews...")
+
+    reviews = list(db.reviews.find({}, {"reviewText": 1}))
+
+    texts = []
+    ids = []
+
+    for r in reviews:
+        cleaned = clean_text(r.get("reviewText", ""))
+
+        if len(cleaned.split()) < 3:
+            continue
+
+        texts.append(cleaned)
+        ids.append(r["_id"])
+
+    print(f"Usable reviews: {len(texts)}")
+
+    if len(texts) < 10:
+        print("Not enough data.")
+        return
+
+    vectorizer = CountVectorizer(
+        stop_words="english",
+        max_df=0.9,
+        min_df=5,
+        ngram_range=(1,2),
+        max_features=5000
+    )
+
+    dtm = vectorizer.fit_transform(texts)
+
+    lda = LatentDirichletAllocation(
+        n_components=5,
+        random_state=42,
+        learning_method="batch"
+    )
+
+    lda.fit(dtm)
+
+    topic_distribution = lda.transform(dtm)
+
+    operations = []
+
+    for i, doc_id in enumerate(ids):
+
+        dominant_topic = int(topic_distribution[i].argmax())
+
+        operations.append(
+            UpdateOne(
+                {"_id": doc_id},
+                {"$set": {"topic_id": dominant_topic + 1}}
+            )
+        )
+
+        if len(operations) == 1000:
+            db.reviews.bulk_write(operations)
+            operations = []
+            print(f"Updated {i+1} reviews...")
+
+    if operations:
+        db.reviews.bulk_write(operations)
+
+    print("--------------------------------------------------")
+    print("ALL Reviews Updated with Topics.")
+    print(f"Total updated: {len(ids)}")
+    print("--------------------------------------------------")
+
+    client.close()
+
 
 if __name__ == "__main__":
     run_topic_modeling()
